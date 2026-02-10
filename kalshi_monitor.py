@@ -785,7 +785,7 @@ def run_single_check(args: argparse.Namespace) -> bool:
     Returns True if a notification was sent (or would have been sent in dry-run).
     """
     old_state = load_state(args.state_file)
-    old_snapshot = old_state.get("snapshot", {})
+    old_snapshot = filter_yearly_events(old_state.get("snapshot", {}))
 
     # Fetch current data from all series
     new_snapshot: dict[str, Any] = {}
