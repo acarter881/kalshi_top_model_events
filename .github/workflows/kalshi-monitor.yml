@@ -1,0 +1,62 @@
+name: Kalshi AI Model Monitor
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: "Send notification even if no changes (shows market summary)"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Run without sending Discord messages"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state from cache
+        uses: actions/cache@v4
+        with:
+          path: .github/state/
+          key: kalshi-state-${{ github.ref_name }}
+          restore-keys: |
+            kalshi-state-
+
+      - name: Run Kalshi monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          ARGS="--loop --max-checks 4 --min-interval-seconds 60 --max-interval-seconds 120"
+
+          if [ "${{ inputs.force_send }}" = "true" ]; then
+            ARGS="$ARGS --force-send"
+          fi
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          python kalshi_monitor.py $ARGS
