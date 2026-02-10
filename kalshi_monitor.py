@@ -7,9 +7,12 @@ Discord notifications when significant changes are detected, including:
 - Significant price movements on existing contracts
 - New market options added to existing events
 - Markets settled/resolved
+- Settlement source changes (e.g., data source URL swap)
+- Contract terms PDF updates (rule changes)
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -36,10 +39,12 @@ SERIES_CONFIG = {
     "KXTOPMODEL": {
         "slug": "top-model",
         "label": "Top AI Model",
+        "contract_terms_url": "https://kalshi-public-docs.s3.amazonaws.com/contract_terms/TOPMODEL.pdf",
     },
     "KXLLM1": {
         "slug": "yearend-top-llm",
         "label": "Best AI",
+        "contract_terms_url": "https://kalshi-public-docs.s3.amazonaws.com/contract_terms/LLM1.pdf",
     },
 }
 
@@ -211,6 +216,50 @@ def fetch_series_events(
     return all_events
 
 
+def fetch_event_metadata(
+    event_ticker: str,
+    *,
+    timeout: int = REQUEST_TIMEOUT,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> dict:
+    """Fetch metadata for a specific event, including settlement sources."""
+    url = f"{KALSHI_API_BASE}/events/{event_ticker}/metadata"
+    return fetch_with_retries(url, timeout=timeout, retries=retries, backoff=backoff)
+
+
+def fetch_pdf_hash(
+    url: str,
+    *,
+    timeout: int = REQUEST_TIMEOUT,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> str | None:
+    """Download a PDF and return its SHA-256 hex digest, or None on failure."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return hashlib.sha256(resp.content).hexdigest()
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = backoff * (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "PDF fetch from %s failed (attempt %d/%d), retrying in %.1fs: %s",
+                    url,
+                    attempt + 1,
+                    retries + 1,
+                    wait,
+                    last_exc,
+                )
+                time.sleep(wait)
+
+    logger.error("Failed to fetch PDF from %s: %s", url, last_exc)
+    return None
+
+
 def derive_market_name(market: dict) -> str:
     """
     Derive a human-readable name for a market option.
@@ -331,12 +380,13 @@ def diff_snapshots(
     Compare two snapshots and return structured changes.
 
     Returns dict with keys:
-      new_events       – list of event tickers that are brand new
-      removed_events   – list of event tickers that disappeared
-      new_markets      – list of (event_ticker, market_ticker) for new options
-      removed_markets  – list of (event_ticker, market_ticker)
-      price_changes    – list of dicts with price movement details
-      settled_markets  – list of (event_ticker, market_ticker, result)
+      new_events                – list of event tickers that are brand new
+      removed_events            – list of event tickers that disappeared
+      new_markets               – list of (event_ticker, market_ticker) for new options
+      removed_markets           – list of (event_ticker, market_ticker)
+      price_changes             – list of dicts with price movement details
+      settled_markets           – list of (event_ticker, market_ticker, result)
+      settlement_source_changes – list of dicts with event_ticker, old/new sources
     """
     changes: dict[str, list] = {
         "new_events": [],
@@ -345,6 +395,7 @@ def diff_snapshots(
         "removed_markets": [],
         "price_changes": [],
         "settled_markets": [],
+        "settlement_source_changes": [],
     }
 
     old_event_tickers = set(old.keys())
@@ -400,7 +451,43 @@ def diff_snapshots(
                         }
                     )
 
+        # Settlement source changes
+        old_sources = old[et].get("settlement_sources") or []
+        new_sources = new[et].get("settlement_sources") or []
+        # Normalize for comparison: sort by name to ignore ordering changes
+        old_sorted = sorted(old_sources, key=lambda s: s.get("name", ""))
+        new_sorted = sorted(new_sources, key=lambda s: s.get("name", ""))
+        if old_sorted != new_sorted and old_sources:
+            # Only alert if we had old sources (skip first-time population)
+            changes["settlement_source_changes"].append(
+                {
+                    "event_ticker": et,
+                    "title": new[et].get("title", et),
+                    "old_sources": old_sources,
+                    "new_sources": new_sources,
+                }
+            )
+
     return changes
+
+
+def diff_pdf_hashes(
+    old_hashes: dict[str, str], new_hashes: dict[str, str]
+) -> list[dict]:
+    """Compare old and new PDF hashes. Returns list of changed series."""
+    pdf_changes: list[dict] = []
+    for series_ticker, new_hash in new_hashes.items():
+        old_hash = old_hashes.get(series_ticker)
+        if old_hash and old_hash != new_hash:
+            cfg = SERIES_CONFIG.get(series_ticker, {})
+            pdf_changes.append(
+                {
+                    "series_ticker": series_ticker,
+                    "label": cfg.get("label", series_ticker),
+                    "contract_terms_url": cfg.get("contract_terms_url", ""),
+                }
+            )
+    return pdf_changes
 
 
 def has_changes(changes: dict) -> bool:
@@ -452,6 +539,7 @@ COLOR_NEW_OPTION = 0x5865F2  # blurple
 COLOR_SETTLED = 0xEB459E  # pink/red
 COLOR_REMOVED = 0xED4245  # red
 COLOR_SUMMARY = 0x5865F2  # blurple
+COLOR_RULES_CHANGE = 0xFF9900  # orange
 
 
 def build_market_table(markets: dict, show_volume: bool = True) -> str:
@@ -621,6 +709,66 @@ def build_embeds(
                 "title": "Markets Settled",
                 "description": "\n".join(lines),
                 "color": COLOR_SETTLED,
+                "footer": {"text": now_str},
+            }
+        )
+
+    # --- Settlement source changes ---
+    if changes.get("settlement_source_changes"):
+        lines = []
+        for sc in changes["settlement_source_changes"]:
+            et = sc["event_ticker"]
+            title = sc["title"]
+            old_src = sc["old_sources"]
+            new_src = sc["new_sources"]
+
+            old_names = {s.get("name", "") for s in old_src}
+            new_names = {s.get("name", "") for s in new_src}
+            new_map = {s.get("name", ""): s.get("url", "") for s in new_src}
+
+            detail_parts = []
+            for name in sorted(new_names - old_names):
+                detail_parts.append(f"Added: [{name}]({new_map.get(name, '')})")
+            for name in sorted(old_names - new_names):
+                detail_parts.append(f"Removed: {name}")
+            # URL changes for sources that exist in both
+            for s_old in old_src:
+                for s_new in new_src:
+                    if (
+                        s_old.get("name") == s_new.get("name")
+                        and s_old.get("url") != s_new.get("url")
+                    ):
+                        detail_parts.append(
+                            f"**{s_new['name']}** URL changed → [{s_new['url']}]({s_new['url']})"
+                        )
+
+            detail = "\n".join(detail_parts) if detail_parts else "Sources updated"
+            lines.append(f"**{title}** (`{et}`)\n{detail}")
+
+        all_embeds.append(
+            {
+                "title": "Settlement Source Changed",
+                "description": "\n\n".join(lines),
+                "color": COLOR_RULES_CHANGE,
+                "footer": {"text": now_str},
+            }
+        )
+
+    # --- Contract terms PDF changes ---
+    if changes.get("pdf_changes"):
+        lines = []
+        for pc in changes["pdf_changes"]:
+            label = pc["label"]
+            url = pc.get("contract_terms_url", "")
+            if url:
+                lines.append(f"**{label}** contract terms updated — [View PDF]({url})")
+            else:
+                lines.append(f"**{label}** contract terms updated")
+        all_embeds.append(
+            {
+                "title": "Contract Rules Updated",
+                "description": "\n\n".join(lines),
+                "color": COLOR_RULES_CHANGE,
                 "footer": {"text": now_str},
             }
         )
@@ -821,8 +969,60 @@ def run_single_check(args: argparse.Namespace) -> bool:
     if filtered_count:
         logger.info("Filtered out %d yearly event(s)", filtered_count)
 
+    # Fetch settlement sources for each event via metadata endpoint
+    for et in new_snapshot:
+        try:
+            meta = fetch_event_metadata(
+                et,
+                timeout=args.timeout_seconds,
+                retries=args.retries,
+                backoff=args.retry_backoff_seconds,
+            )
+            sources = meta.get("settlement_sources") or []
+            new_snapshot[et]["settlement_sources"] = sources
+            if sources:
+                logger.info(
+                    "  %s settlement sources: %s",
+                    et,
+                    ", ".join(s.get("name", "?") for s in sources),
+                )
+        except Exception as exc:
+            logger.warning("Failed to fetch metadata for %s: %s", et, exc)
+            # Carry forward old sources if available to avoid false diffs
+            old_sources = old_snapshot.get(et, {}).get("settlement_sources")
+            if old_sources is not None:
+                new_snapshot[et]["settlement_sources"] = old_sources
+
+    # Check contract terms PDFs for changes
+    old_pdf_hashes = old_state.get("pdf_hashes", {})
+    new_pdf_hashes: dict[str, str] = {}
+    for series_ticker, cfg in SERIES_CONFIG.items():
+        pdf_url = cfg.get("contract_terms_url", "")
+        if not pdf_url:
+            continue
+        logger.info("Checking contract terms PDF for %s ...", series_ticker)
+        pdf_hash = fetch_pdf_hash(
+            pdf_url,
+            timeout=args.timeout_seconds,
+            retries=args.retries,
+            backoff=args.retry_backoff_seconds,
+        )
+        if pdf_hash:
+            new_pdf_hashes[series_ticker] = pdf_hash
+            logger.info("  %s PDF hash: %s", series_ticker, pdf_hash[:16])
+        else:
+            # Keep old hash on failure to avoid false diffs
+            if series_ticker in old_pdf_hashes:
+                new_pdf_hashes[series_ticker] = old_pdf_hashes[series_ticker]
+
+    pdf_changes = diff_pdf_hashes(old_pdf_hashes, new_pdf_hashes)
+    if pdf_changes:
+        logger.info("Contract terms PDF changes detected for: %s",
+                     ", ".join(pc["series_ticker"] for pc in pdf_changes))
+
     # Compute diff
     changes = diff_snapshots(old_snapshot, new_snapshot, args.price_threshold)
+    changes["pdf_changes"] = pdf_changes
     changed = has_changes(changes)
 
     if changed:
@@ -868,6 +1068,7 @@ def run_single_check(args: argparse.Namespace) -> bool:
     # Persist new state
     new_state = {
         "snapshot": new_snapshot,
+        "pdf_hashes": new_pdf_hashes,
         "last_check": datetime.now(timezone.utc).isoformat(),
         "last_changed": (
             datetime.now(timezone.utc).isoformat()
