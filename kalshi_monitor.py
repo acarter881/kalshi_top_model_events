@@ -45,8 +45,10 @@ SERIES_CONFIG = {
 
 DEFAULT_STATE_FILE = ".github/state/kalshi_state.json"
 DEFAULT_PRICE_THRESHOLD = 5  # cents
-DISCORD_MESSAGE_LIMIT = 1800
 REQUEST_TIMEOUT = 30
+
+# Keywords in event titles that indicate a yearly event (case-insensitive)
+YEARLY_TITLE_KEYWORDS = ("year", "annual", "end of 202")
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,6 +280,45 @@ def build_snapshot(events: list[dict]) -> dict:
     return snapshot
 
 
+def is_yearly_event(event: dict) -> bool:
+    """Check if an event is a yearly/year-end event that should be excluded."""
+    title = (event.get("title") or "").lower()
+    sub_title = (event.get("sub_title") or "").lower()
+    for kw in YEARLY_TITLE_KEYWORDS:
+        if kw in title or kw in sub_title:
+            return True
+    # Ticker ending in dec31 is a year-end event (e.g. KXLLM1-26DEC31)
+    ticker = (event.get("event_ticker") or "").lower()
+    if ticker.endswith("dec31"):
+        return True
+    return False
+
+
+def filter_yearly_events(snapshot: dict) -> dict:
+    """Remove yearly/year-end events from a snapshot."""
+    return {
+        et: ev for et, ev in snapshot.items() if not is_yearly_event(ev)
+    }
+
+
+def event_sort_key(event_ticker: str, snapshot: dict) -> str:
+    """
+    Return a sort key that orders events by close time ascending.
+
+    Weekly events close sooner than monthly, so this naturally
+    produces weekly-first ordering.
+    """
+    ev = snapshot.get(event_ticker, {})
+    markets = ev.get("markets", {})
+    if markets:
+        first_market = next(iter(markets.values()))
+        close_time = first_market.get("close_time", "")
+        if close_time:
+            return close_time
+    # Fall back to strike_date, then ticker (alphabetical)
+    return ev.get("strike_date", "") or event_ticker
+
+
 # ---------------------------------------------------------------------------
 # Diffing
 # ---------------------------------------------------------------------------
@@ -465,8 +506,12 @@ def build_embeds(
     all_embeds: list[dict] = []
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # --- New events ---
-    for et in changes.get("new_events", []):
+    # --- New events (sorted by close time: weekly before monthly) ---
+    new_events_sorted = sorted(
+        changes.get("new_events", []),
+        key=lambda et: event_sort_key(et, new_snapshot),
+    )
+    for et in new_events_sorted:
         ev = new_snapshot.get(et, {})
         series = ev.get("series_ticker", "")
         label = SERIES_CONFIG.get(series, {}).get("label", series)
@@ -580,9 +625,14 @@ def build_embeds(
             }
         )
 
-    # --- Force send: full summary ---
+    # --- Force send: full summary (sorted by close time: weekly before monthly) ---
     if not all_embeds and force_send:
-        for et, ev in sorted(new_snapshot.items()):
+        sorted_event_tickers = sorted(
+            new_snapshot.keys(),
+            key=lambda et: event_sort_key(et, new_snapshot),
+        )
+        for et in sorted_event_tickers:
+            ev = new_snapshot[et]
             series = ev.get("series_ticker", "")
             label = SERIES_CONFIG.get(series, {}).get("label", series)
             title = ev.get("title", et)
@@ -763,6 +813,13 @@ def run_single_check(args: argparse.Namespace) -> bool:
     if not new_snapshot:
         logger.warning("No event data retrieved — skipping this check")
         return False
+
+    # Filter out yearly/year-end events
+    before_count = len(new_snapshot)
+    new_snapshot = filter_yearly_events(new_snapshot)
+    filtered_count = before_count - len(new_snapshot)
+    if filtered_count:
+        logger.info("Filtered out %d yearly event(s)", filtered_count)
 
     # Compute diff
     changes = diff_snapshots(old_snapshot, new_snapshot, args.price_threshold)
