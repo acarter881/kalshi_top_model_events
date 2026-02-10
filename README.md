@@ -20,6 +20,8 @@ Discord messages are sent when:
 - **New option added** — a new AI model is added as a tradable option in an existing event
 - **Market settled** — an event resolves with a winner
 - **Event removed** — a market closes or disappears
+- **Settlement source changed** — Kalshi changes the data source used to resolve a market (e.g., swaps one leaderboard URL for another)
+- **Contract rules updated** — the contract terms PDF for a series is modified (rule changes, tiebreaker updates, eligibility changes, etc.)
 
 ## How It Works
 
@@ -28,6 +30,10 @@ GitHub Actions (cron every 10 min)
   └─ kalshi_monitor.py
        ├─ Fetches open events from Kalshi public API (no auth needed)
        │    GET /trade-api/v2/events?series_ticker=...&status=open&with_nested_markets=true
+       ├─ Fetches event metadata for settlement sources
+       │    GET /trade-api/v2/events/{event_ticker}/metadata
+       ├─ Downloads & hashes contract terms PDFs to detect rule changes
+       │    https://kalshi-public-docs.s3.amazonaws.com/contract_terms/{SERIES}.pdf
        ├─ Compares current snapshot against cached state
        ├─ Sends Discord webhook for any detected changes
        └─ Saves updated state to Actions cache
@@ -56,6 +62,15 @@ From the Actions tab, click "Run workflow" with optional inputs:
 |-------|-------------|
 | `force_send` | Send a full market summary even if nothing changed |
 | `dry_run` | Run the monitor without actually sending Discord messages (logs only) |
+
+### When to manually run the action
+
+You **should** trigger a manual run with `force_send` after:
+
+- **Merging code changes** that affect state structure (new fields in the snapshot, new series added, filter changes). The first run after such changes seeds the new data into the cache so subsequent automated runs can diff against it correctly. Without this, the first automated run may produce a false positive or silently skip alerting on new data categories.
+- **Clearing the Actions cache** — if you delete the `kalshi-state-*` cache entry, the next run starts from a blank slate. A `force_send` run will both repopulate the cache and send you a full market summary so you can confirm everything looks right.
+
+You **do not** need to manually run after routine changes (e.g., tweaking the price threshold or cron schedule) — the next scheduled run will pick those up automatically.
 
 ## CLI Usage
 
