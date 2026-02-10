@@ -10,12 +10,10 @@ Discord notifications when significant changes are detected, including:
 """
 
 import argparse
-import hashlib
 import json
 import logging
 import os
 import random
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,6 +209,30 @@ def fetch_series_events(
     return all_events
 
 
+def derive_market_name(market: dict) -> str:
+    """
+    Derive a human-readable name for a market option.
+
+    Tries multiple fields in order of preference, falling back to
+    extracting the suffix from the market ticker itself.
+    """
+    for field in ("subtitle", "yes_sub_title", "no_sub_title"):
+        val = (market.get(field) or "").strip()
+        if val:
+            return val
+
+    # Fall back to ticker suffix: e.g. KXTOPMODEL-26FEB14-GEMINI -> GEMINI
+    ticker = market.get("ticker", "")
+    parts = ticker.split("-")
+    if len(parts) >= 3:
+        suffix = "-".join(parts[2:])
+        # Titlecase it for readability: CHATGPT -> Chatgpt, GPT4O -> Gpt4O
+        return suffix.replace("-", " ").title()
+
+    # Last resort
+    return market.get("title", ticker) or ticker
+
+
 def build_snapshot(events: list[dict]) -> dict:
     """
     Build a normalized snapshot from raw Kalshi events.
@@ -227,9 +249,12 @@ def build_snapshot(events: list[dict]) -> dict:
         markets: dict[str, Any] = {}
         for m in markets_raw:
             ticker = m.get("ticker", "")
+            name = derive_market_name(m)
             markets[ticker] = {
+                "name": name,
                 "title": m.get("title", ""),
                 "subtitle": m.get("subtitle", ""),
+                "yes_sub_title": m.get("yes_sub_title", ""),
                 "status": m.get("status", ""),
                 "yes_bid": m.get("yes_bid"),
                 "yes_ask": m.get("yes_ask"),
@@ -238,6 +263,7 @@ def build_snapshot(events: list[dict]) -> dict:
                 "volume_24h": m.get("volume_24h"),
                 "open_interest": m.get("open_interest"),
                 "close_time": m.get("close_time", ""),
+                "result": m.get("result", ""),
             }
 
         snapshot[event_ticker] = {
@@ -315,7 +341,7 @@ def diff_snapshots(
 
             # Detect settlement
             if om.get("status") != "settled" and nm.get("status") == "settled":
-                changes["settled_markets"].append((et, mt, nm.get("subtitle", "")))
+                changes["settled_markets"].append((et, mt, nm.get("name", mt)))
                 continue
 
             if old_price is not None and new_price is not None:
@@ -325,7 +351,7 @@ def diff_snapshots(
                         {
                             "event_ticker": et,
                             "market_ticker": mt,
-                            "subtitle": nm.get("subtitle", ""),
+                            "name": nm.get("name", mt),
                             "old_price": old_price,
                             "new_price": new_price,
                             "delta": delta,
@@ -353,11 +379,11 @@ def validate_webhook_url(url: str) -> bool:
     )
 
 
-def price_display(cents: int | None) -> str:
-    """Format a cent price as a dollar string with implied probability."""
+def cents_str(cents: int | None) -> str:
+    """Format a cent price as a readable string: 57¢ (57%)."""
     if cents is None:
-        return "N/A"
-    return f"${cents / 100:.2f} ({cents}%)"
+        return "—"
+    return f"{cents}¢ ({cents}%)"
 
 
 def event_web_url(series_ticker: str, event_ticker: str) -> str:
@@ -367,139 +393,266 @@ def event_web_url(series_ticker: str, event_ticker: str) -> str:
     return f"{KALSHI_WEB_BASE}/{series_ticker.lower()}/{slug}/{event_ticker.lower()}"
 
 
-def build_message(
+def format_close_time(close_time: str) -> str:
+    """Format an ISO close time to a short human string."""
+    if not close_time:
+        return ""
+    try:
+        dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %H:%M UTC")
+    except (ValueError, TypeError):
+        return close_time
+
+
+# Discord embed color palette
+COLOR_NEW_EVENT = 0x57F287  # green
+COLOR_PRICE_MOVE = 0xFEE75C  # yellow
+COLOR_NEW_OPTION = 0x5865F2  # blurple
+COLOR_SETTLED = 0xEB459E  # pink/red
+COLOR_REMOVED = 0xED4245  # red
+COLOR_SUMMARY = 0x5865F2  # blurple
+
+
+def build_market_table(markets: dict, show_volume: bool = True) -> str:
+    """
+    Build a code-block table of ALL markets for an event, sorted by price desc.
+    """
+    sorted_markets = sorted(
+        markets.values(),
+        key=lambda m: m.get("last_price") or 0,
+        reverse=True,
+    )
+
+    lines: list[str] = []
+
+    # Header
+    if show_volume:
+        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6} {'Vol24h':>7}")
+        lines.append("-" * 49)
+    else:
+        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6}")
+        lines.append("-" * 42)
+
+    for m in sorted_markets:
+        name = (m.get("name") or "Unknown")[:20]
+        last = m.get("last_price")
+        bid = m.get("yes_bid")
+        ask = m.get("yes_ask")
+
+        last_s = f"{last}¢" if last is not None else "—"
+        bid_s = f"{bid}¢" if bid is not None else "—"
+        ask_s = f"{ask}¢" if ask is not None else "—"
+
+        if show_volume:
+            vol = m.get("volume_24h")
+            vol_s = str(vol) if vol is not None else "—"
+            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6} {vol_s:>7}")
+        else:
+            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6}")
+
+    return "\n".join(lines)
+
+
+def build_embeds(
     changes: dict, new_snapshot: dict, force_send: bool
-) -> str:
-    """Build a Discord notification message from detected changes."""
-    sections: list[str] = []
+) -> list[list[dict]]:
+    """
+    Build Discord embed payloads from detected changes.
+
+    Returns a list of "messages", where each message is a list of embeds.
+    Discord allows max 10 embeds per message, so we batch accordingly.
+    """
+    all_embeds: list[dict] = []
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # --- New events ---
-    if changes["new_events"]:
-        lines = [f"**New Events Created** ({now_str})"]
-        for et in changes["new_events"]:
-            ev = new_snapshot.get(et, {})
-            series = ev.get("series_ticker", "")
-            label = SERIES_CONFIG.get(series, {}).get("label", series)
-            title = ev.get("title", et)
-            url = event_web_url(series, et)
-            market_count = len(ev.get("markets", {}))
-            lines.append(f"• **{label}**: [{title}]({url}) — {market_count} options")
+    for et in changes.get("new_events", []):
+        ev = new_snapshot.get(et, {})
+        series = ev.get("series_ticker", "")
+        label = SERIES_CONFIG.get(series, {}).get("label", series)
+        title = ev.get("title", et)
+        url = event_web_url(series, et)
+        markets = ev.get("markets", {})
+        close_time = ""
+        if markets:
+            # Use close time from first market
+            first_market = next(iter(markets.values()))
+            close_time = format_close_time(first_market.get("close_time", ""))
 
-            # Show top options by price for new events
-            markets = ev.get("markets", {})
-            top_markets = sorted(
-                markets.values(),
-                key=lambda m: m.get("last_price") or 0,
-                reverse=True,
-            )[:5]
-            for m in top_markets:
-                sub = m.get("subtitle", "Unknown")
-                lp = price_display(m.get("last_price"))
-                lines.append(f"  └ {sub}: {lp}")
+        table = build_market_table(markets)
 
-        sections.append("\n".join(lines))
+        description = f"**[{title}]({url})**\n"
+        if close_time:
+            description += f"Closes: {close_time}\n"
+        description += f"Options: {len(markets)}\n"
+        description += f"```\n{table}\n```"
+
+        all_embeds.append(
+            {
+                "title": f"New Event: {label}",
+                "description": description,
+                "color": COLOR_NEW_EVENT,
+                "footer": {"text": f"{et} | {now_str}"},
+            }
+        )
 
     # --- Removed events ---
-    if changes["removed_events"]:
-        lines = [f"**Events Closed/Removed** ({now_str})"]
+    if changes.get("removed_events"):
+        lines = []
         for et in changes["removed_events"]:
-            lines.append(f"• `{et}`")
-        sections.append("\n".join(lines))
+            lines.append(f"- `{et}`")
+        all_embeds.append(
+            {
+                "title": "Events Closed / Removed",
+                "description": "\n".join(lines),
+                "color": COLOR_REMOVED,
+                "footer": {"text": now_str},
+            }
+        )
 
     # --- New markets (options) within existing events ---
-    if changes["new_markets"]:
-        lines = [f"**New Options Added** ({now_str})"]
+    if changes.get("new_markets"):
+        lines = []
         for et, mt in changes["new_markets"]:
             ev = new_snapshot.get(et, {})
             m = ev.get("markets", {}).get(mt, {})
-            sub = m.get("subtitle", mt)
-            lp = price_display(m.get("last_price"))
+            name = m.get("name", mt)
+            last = cents_str(m.get("last_price"))
+            bid = cents_str(m.get("yes_bid"))
+            ask = cents_str(m.get("yes_ask"))
             series = ev.get("series_ticker", "")
             url = event_web_url(series, et)
-            lines.append(f"• [{et}]({url}): **{sub}** at {lp}")
-        sections.append("\n".join(lines))
+            lines.append(
+                f"**{name}** added to [{et}]({url})\n"
+                f"Last: {last} | Bid: {bid} | Ask: {ask}"
+            )
+        all_embeds.append(
+            {
+                "title": "New Options Added",
+                "description": "\n\n".join(lines),
+                "color": COLOR_NEW_OPTION,
+                "footer": {"text": now_str},
+            }
+        )
 
     # --- Price changes ---
-    if changes["price_changes"]:
-        # Sort by absolute delta descending
+    if changes.get("price_changes"):
         sorted_changes = sorted(
             changes["price_changes"], key=lambda x: abs(x["delta"]), reverse=True
         )
-        lines = [f"**Price Movements** ({now_str})"]
+        lines = []
         for pc in sorted_changes:
-            direction = "↑" if pc["delta"] > 0 else "↓"
-            sub = pc["subtitle"]
-            old_p = price_display(pc["old_price"])
-            new_p = price_display(pc["new_price"])
-            delta_abs = abs(pc["delta"])
-            vol = pc.get("volume_24h")
-            vol_str = f" (24h vol: {vol})" if vol else ""
-            lines.append(
-                f"• **{sub}** {direction} {delta_abs}¢: {old_p} → {new_p}{vol_str}"
-            )
-            # Add event context
+            direction = "+" if pc["delta"] > 0 else ""
+            name = pc["name"]
+            old_p = cents_str(pc["old_price"])
+            new_p = cents_str(pc["new_price"])
+            delta = pc["delta"]
             et = pc["event_ticker"]
             ev = new_snapshot.get(et, {})
             series = ev.get("series_ticker", "")
             url = event_web_url(series, et)
-            lines.append(f"  └ [{et}]({url})")
-        sections.append("\n".join(lines))
+            vol = pc.get("volume_24h")
+            vol_str = f" | 24h vol: {vol}" if vol else ""
+            lines.append(
+                f"**{name}** ({direction}{delta}¢): {old_p} → {new_p}{vol_str}\n"
+                f"[{et}]({url})"
+            )
+        all_embeds.append(
+            {
+                "title": "Price Movements",
+                "description": "\n\n".join(lines),
+                "color": COLOR_PRICE_MOVE,
+                "footer": {"text": now_str},
+            }
+        )
 
     # --- Settled markets ---
-    if changes["settled_markets"]:
-        lines = [f"**Markets Settled** ({now_str})"]
+    if changes.get("settled_markets"):
+        lines = []
         for et, mt, result in changes["settled_markets"]:
-            lines.append(f"• `{et}` — **{result}** settled")
-        sections.append("\n".join(lines))
+            lines.append(f"**{result}** — `{et}`")
+        all_embeds.append(
+            {
+                "title": "Markets Settled",
+                "description": "\n".join(lines),
+                "color": COLOR_SETTLED,
+                "footer": {"text": now_str},
+            }
+        )
 
-    if not sections and force_send:
-        # Force send: show current state summary
-        lines = [f"**Kalshi AI Markets Summary** ({now_str})"]
+    # --- Force send: full summary ---
+    if not all_embeds and force_send:
         for et, ev in sorted(new_snapshot.items()):
             series = ev.get("series_ticker", "")
             label = SERIES_CONFIG.get(series, {}).get("label", series)
+            title = ev.get("title", et)
             url = event_web_url(series, et)
-            lines.append(f"\n**[{label}: {et}]({url})**")
-
             markets = ev.get("markets", {})
-            top_markets = sorted(
-                markets.values(),
-                key=lambda m: m.get("last_price") or 0,
-                reverse=True,
-            )[:5]
-            for m in top_markets:
-                sub = m.get("subtitle", "Unknown")
-                lp = price_display(m.get("last_price"))
-                bid = price_display(m.get("yes_bid"))
-                ask = price_display(m.get("yes_ask"))
-                lines.append(f"  {sub}: Last {lp} | Bid {bid} | Ask {ask}")
+            close_time = ""
+            if markets:
+                first_market = next(iter(markets.values()))
+                close_time = format_close_time(first_market.get("close_time", ""))
 
-        sections.append("\n".join(lines))
+            table = build_market_table(markets)
 
-    message = "\n\n".join(sections)
+            description = f"**[{title}]({url})**\n"
+            if close_time:
+                description += f"Closes: {close_time}\n"
+            description += f"Options: {len(markets)}\n"
+            description += f"```\n{table}\n```"
 
-    # Truncate if needed
-    if len(message) > DISCORD_MESSAGE_LIMIT:
-        truncated_note = "\n\n*(Message truncated — see Kalshi for full details)*"
-        message = message[: DISCORD_MESSAGE_LIMIT - len(truncated_note)] + truncated_note
+            all_embeds.append(
+                {
+                    "title": f"{label}: {et}",
+                    "description": description,
+                    "color": COLOR_SUMMARY,
+                    "footer": {"text": now_str},
+                }
+            )
 
-    return message
+    # Batch into messages of up to 10 embeds each (Discord limit)
+    messages: list[list[dict]] = []
+    for i in range(0, len(all_embeds), 10):
+        messages.append(all_embeds[i : i + 10])
+
+    return messages
 
 
-def send_discord_message(
+def send_discord_embeds(
     webhook_url: str,
-    message: str,
+    embed_messages: list[list[dict]],
     *,
     retries: int = 3,
     backoff: float = 2.0,
 ) -> bool:
-    """Post a message to a Discord webhook. Returns True on success."""
+    """Post embed messages to a Discord webhook. Returns True if all succeed."""
     if not validate_webhook_url(webhook_url):
         logger.error("Invalid Discord webhook URL")
         return False
 
-    payload = {"content": message}
+    all_ok = True
+    for msg_idx, embeds in enumerate(embed_messages):
+        payload = {"embeds": embeds}
+        success = _post_discord_payload(
+            webhook_url, payload, retries=retries, backoff=backoff
+        )
+        if not success:
+            all_ok = False
+        # Small delay between multi-message sends to avoid rate limits
+        if msg_idx < len(embed_messages) - 1:
+            time.sleep(1.5)
+
+    return all_ok
+
+
+def _post_discord_payload(
+    webhook_url: str,
+    payload: dict,
+    *,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> bool:
+    """Post a JSON payload to a Discord webhook with retries. Returns True on success."""
     last_exc: Exception | None = None
 
     for attempt in range(retries + 1):
@@ -513,7 +666,6 @@ def send_discord_message(
                 logger.info("Discord message sent successfully")
                 return True
             if resp.status_code == 429:
-                # Rate limited — respect retry_after
                 retry_after = resp.json().get("retry_after", 5)
                 logger.warning("Discord rate limited, waiting %.1fs", retry_after)
                 time.sleep(retry_after)
@@ -624,23 +776,34 @@ def run_single_check(args: argparse.Namespace) -> bool:
     else:
         logger.info("No significant changes detected")
 
-    # Build and send message
+    # Build and send embeds
     should_send = changed or args.force_send
     if should_send:
-        message = build_message(changes, new_snapshot, args.force_send)
-        if message.strip():
+        embed_messages = build_embeds(changes, new_snapshot, args.force_send)
+        if embed_messages:
             if args.dry_run:
-                logger.info("DRY RUN — would send:\n%s", message)
+                logger.info(
+                    "DRY RUN — would send %d message(s) with %d embed(s)",
+                    len(embed_messages),
+                    sum(len(m) for m in embed_messages),
+                )
+                for i, embeds in enumerate(embed_messages):
+                    for e in embeds:
+                        logger.info(
+                            "  [msg %d] %s: %s",
+                            i + 1,
+                            e.get("title", ""),
+                            e.get("description", "")[:200],
+                        )
             else:
                 if not args.webhook_url:
                     logger.error(
                         "No webhook URL provided. Set DISCORD_WEBHOOK_URL or use --webhook-url"
                     )
-                    # Still save state so we don't re-alert
                 else:
-                    send_discord_message(
+                    send_discord_embeds(
                         args.webhook_url,
-                        message,
+                        embed_messages,
                         retries=args.retries,
                         backoff=args.retry_backoff_seconds,
                     )
