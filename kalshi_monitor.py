@@ -18,7 +18,7 @@ import logging
 import os
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,18 +39,25 @@ SERIES_CONFIG = {
     "KXTOPMODEL": {
         "slug": "top-model",
         "label": "Top AI Model",
+        "description": "#1 ranked model on LM Arena",
         "contract_terms_url": "https://kalshi-public-docs.s3.amazonaws.com/contract_terms/TOPMODEL.pdf",
+        "sort_order": 0,
     },
     "KXLLM1": {
         "slug": "yearend-top-llm",
         "label": "Best AI",
+        "description": "Best overall AI model of the period",
         "contract_terms_url": "https://kalshi-public-docs.s3.amazonaws.com/contract_terms/LLM1.pdf",
+        "sort_order": 1,
     },
 }
 
 DEFAULT_STATE_FILE = ".github/state/kalshi_state.json"
 DEFAULT_PRICE_THRESHOLD = 5  # cents
 REQUEST_TIMEOUT = 30
+
+# US Central time (CST/CDT) — UTC-6 standard, UTC-5 daylight
+CST = timezone(timedelta(hours=-6))
 
 # Keywords in event titles that indicate a yearly event (case-insensitive)
 YEARLY_TITLE_KEYWORDS = ("year", "annual", "end of 202")
@@ -350,22 +357,25 @@ def filter_yearly_events(snapshot: dict) -> dict:
     }
 
 
-def event_sort_key(event_ticker: str, snapshot: dict) -> str:
+def event_sort_key(event_ticker: str, snapshot: dict) -> tuple:
     """
-    Return a sort key that orders events by close time ascending.
+    Return a sort key that groups events by series, then by close time.
 
-    Weekly events close sooner than monthly, so this naturally
-    produces weekly-first ordering.
+    This produces: all KXTOPMODEL events (weekly before monthly),
+    then all KXLLM1 events (weekly before monthly).
     """
     ev = snapshot.get(event_ticker, {})
+    series = ev.get("series_ticker", "")
+    series_order = SERIES_CONFIG.get(series, {}).get("sort_order", 99)
+
+    close_time = ""
     markets = ev.get("markets", {})
     if markets:
         first_market = next(iter(markets.values()))
         close_time = first_market.get("close_time", "")
-        if close_time:
-            return close_time
-    # Fall back to strike_date, then ticker (alphabetical)
-    return ev.get("strike_date", "") or event_ticker
+
+    time_key = close_time or ev.get("strike_date", "") or event_ticker
+    return (series_order, time_key)
 
 
 # ---------------------------------------------------------------------------
@@ -522,12 +532,13 @@ def event_web_url(series_ticker: str, event_ticker: str) -> str:
 
 
 def format_close_time(close_time: str) -> str:
-    """Format an ISO close time to a short human string."""
+    """Format an ISO close time to a short human string in CST."""
     if not close_time:
         return ""
     try:
         dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-        return dt.strftime("%b %d, %Y %H:%M UTC")
+        dt_cst = dt.astimezone(CST)
+        return dt_cst.strftime("%b %d, %Y %-I:%M %p CST")
     except (ValueError, TypeError):
         return close_time
 
@@ -556,8 +567,8 @@ def build_market_table(markets: dict, show_volume: bool = True) -> str:
 
     # Header
     if show_volume:
-        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6} {'Vol24h':>7}")
-        lines.append("-" * 49)
+        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6} {'24h Vol':>10}")
+        lines.append("-" * 52)
     else:
         lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6}")
         lines.append("-" * 42)
@@ -574,10 +585,14 @@ def build_market_table(markets: dict, show_volume: bool = True) -> str:
 
         if show_volume:
             vol = m.get("volume_24h")
-            vol_s = str(vol) if vol is not None else "—"
-            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6} {vol_s:>7}")
+            vol_s = f"{vol:,}" if vol is not None else "—"
+            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6} {vol_s:>10}")
         else:
             lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6}")
+
+    if show_volume:
+        lines.append("")
+        lines.append("24h Vol = contracts traded in last 24 hours")
 
     return "\n".join(lines)
 
@@ -592,7 +607,7 @@ def build_embeds(
     Discord allows max 10 embeds per message, so we batch accordingly.
     """
     all_embeds: list[dict] = []
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_str = datetime.now(CST).strftime("%b %d, %Y %-I:%M %p CST")
 
     # --- New events (sorted by close time: weekly before monthly) ---
     new_events_sorted = sorted(
@@ -620,9 +635,14 @@ def build_embeds(
         description += f"Options: {len(markets)}\n"
         description += f"```\n{table}\n```"
 
+        series_desc = SERIES_CONFIG.get(series, {}).get("description", "")
+        embed_title = f"New Event: {label}"
+        if series_desc:
+            embed_title += f" — {series_desc}"
+
         all_embeds.append(
             {
-                "title": f"New Event: {label}",
+                "title": embed_title,
                 "description": description,
                 "color": COLOR_NEW_EVENT,
                 "footer": {"text": f"{et} | {now_str}"},
@@ -685,7 +705,7 @@ def build_embeds(
             series = ev.get("series_ticker", "")
             url = event_web_url(series, et)
             vol = pc.get("volume_24h")
-            vol_str = f" | 24h vol: {vol}" if vol else ""
+            vol_str = f" | 24h vol: {vol:,} contracts" if vol else ""
             lines.append(
                 f"**{name}** ({direction}{delta}¢): {old_p} → {new_p}{vol_str}\n"
                 f"[{et}]({url})"
@@ -799,9 +819,14 @@ def build_embeds(
             description += f"Options: {len(markets)}\n"
             description += f"```\n{table}\n```"
 
+            series_desc = SERIES_CONFIG.get(series, {}).get("description", "")
+            embed_title = f"{label}: {et}"
+            if series_desc:
+                embed_title += f" — {series_desc}"
+
             all_embeds.append(
                 {
-                    "title": f"{label}: {et}",
+                    "title": embed_title,
                     "description": description,
                     "color": COLOR_SUMMARY,
                     "footer": {"text": now_str},
