@@ -357,6 +357,72 @@ def filter_yearly_events(snapshot: dict) -> dict:
     }
 
 
+def derive_event_period(event: dict) -> str:
+    """
+    Derive 'Weekly' or 'Monthly' from an event's title/subtitle or close time.
+
+    Heuristics (in order):
+      1. If title or subtitle contains 'week' → Weekly
+      2. If title or subtitle contains 'month' → Monthly
+      3. If close time falls on the last 3 days of the month → Monthly
+      4. Otherwise → Weekly
+    """
+    title = (event.get("title") or "").lower()
+    sub_title = (event.get("sub_title") or "").lower()
+
+    if "week" in title or "week" in sub_title:
+        return "Weekly"
+    if "month" in title or "month" in sub_title:
+        return "Monthly"
+
+    # Fall back to close time: last 3 days of month → Monthly
+    markets = event.get("markets", {})
+    if markets:
+        first_market = next(iter(markets.values()))
+        close_str = first_market.get("close_time", "")
+        if close_str:
+            try:
+                dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                # Check if close date is in the last 3 days of its month
+                next_month = (dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+                last_day = (next_month - timedelta(days=1)).day
+                if dt.day >= last_day - 2:
+                    return "Monthly"
+            except (ValueError, TypeError):
+                pass
+
+    return "Weekly"
+
+
+def format_event_label(event_ticker: str, event: dict) -> str:
+    """
+    Build a human-readable label like 'Top AI Model — Weekly (Feb 14)'.
+    """
+    series = event.get("series_ticker", "")
+    cfg = SERIES_CONFIG.get(series, {})
+    label = cfg.get("label", series)
+    period = derive_event_period(event)
+
+    # Extract a short date from the close time
+    date_str = ""
+    markets = event.get("markets", {})
+    if markets:
+        first_market = next(iter(markets.values()))
+        close = first_market.get("close_time", "")
+        if close:
+            try:
+                dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
+                date_str = dt.strftime("%b %-d")
+            except (ValueError, TypeError):
+                pass
+
+    parts = [label, period]
+    result = " — ".join(parts)
+    if date_str:
+        result += f" ({date_str})"
+    return result
+
+
 def event_sort_key(event_ticker: str, snapshot: dict) -> tuple:
     """
     Return a sort key that groups events by series, then by close time.
@@ -518,10 +584,10 @@ def validate_webhook_url(url: str) -> bool:
 
 
 def cents_str(cents: int | None) -> str:
-    """Format a cent price as a readable string: 57¢ (57%)."""
+    """Format a cent price as a readable string: 57¢."""
     if cents is None:
         return "—"
-    return f"{cents}¢ ({cents}%)"
+    return f"{cents}¢"
 
 
 def event_web_url(series_ticker: str, event_ticker: str) -> str:
@@ -617,35 +683,28 @@ def build_embeds(
     for et in new_events_sorted:
         ev = new_snapshot.get(et, {})
         series = ev.get("series_ticker", "")
-        label = SERIES_CONFIG.get(series, {}).get("label", series)
-        title = ev.get("title", et)
+        friendly = format_event_label(et, ev)
         url = event_web_url(series, et)
         markets = ev.get("markets", {})
         close_time = ""
         if markets:
-            # Use close time from first market
             first_market = next(iter(markets.values()))
             close_time = format_close_time(first_market.get("close_time", ""))
 
         table = build_market_table(markets)
 
-        description = f"**[{title}]({url})**\n"
+        description = f"**[{friendly}]({url})**\n"
         if close_time:
             description += f"Closes: {close_time}\n"
         description += f"Options: {len(markets)}\n"
         description += f"```\n{table}\n```"
 
-        series_desc = SERIES_CONFIG.get(series, {}).get("description", "")
-        embed_title = f"New Event: {label}"
-        if series_desc:
-            embed_title += f" — {series_desc}"
-
         all_embeds.append(
             {
-                "title": embed_title,
+                "title": f"New Event: {friendly}",
                 "description": description,
                 "color": COLOR_NEW_EVENT,
-                "footer": {"text": f"{et} | {now_str}"},
+                "footer": {"text": now_str},
             }
         )
 
@@ -674,9 +733,10 @@ def build_embeds(
             bid = cents_str(m.get("yes_bid"))
             ask = cents_str(m.get("yes_ask"))
             series = ev.get("series_ticker", "")
+            friendly = format_event_label(et, ev)
             url = event_web_url(series, et)
             lines.append(
-                f"**{name}** added to [{et}]({url})\n"
+                f"**{name}** added to [{friendly}]({url})\n"
                 f"Last: {last} | Bid: {bid} | Ask: {ask}"
             )
         all_embeds.append(
@@ -703,12 +763,13 @@ def build_embeds(
             et = pc["event_ticker"]
             ev = new_snapshot.get(et, {})
             series = ev.get("series_ticker", "")
+            friendly = format_event_label(et, ev)
             url = event_web_url(series, et)
             vol = pc.get("volume_24h")
             vol_str = f" | 24h vol: {vol:,} contracts" if vol else ""
             lines.append(
                 f"**{name}** ({direction}{delta}¢): {old_p} → {new_p}{vol_str}\n"
-                f"[{et}]({url})"
+                f"[{friendly}]({url})"
             )
         all_embeds.append(
             {
@@ -802,8 +863,7 @@ def build_embeds(
         for et in sorted_event_tickers:
             ev = new_snapshot[et]
             series = ev.get("series_ticker", "")
-            label = SERIES_CONFIG.get(series, {}).get("label", series)
-            title = ev.get("title", et)
+            friendly = format_event_label(et, ev)
             url = event_web_url(series, et)
             markets = ev.get("markets", {})
             close_time = ""
@@ -813,20 +873,15 @@ def build_embeds(
 
             table = build_market_table(markets)
 
-            description = f"**[{title}]({url})**\n"
+            description = f"**[{friendly}]({url})**\n"
             if close_time:
                 description += f"Closes: {close_time}\n"
             description += f"Options: {len(markets)}\n"
             description += f"```\n{table}\n```"
 
-            series_desc = SERIES_CONFIG.get(series, {}).get("description", "")
-            embed_title = f"{label}: {et}"
-            if series_desc:
-                embed_title += f" — {series_desc}"
-
             all_embeds.append(
                 {
-                    "title": embed_title,
+                    "title": friendly,
                     "description": description,
                     "color": COLOR_SUMMARY,
                     "footer": {"text": now_str},
