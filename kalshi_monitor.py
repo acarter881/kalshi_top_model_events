@@ -499,18 +499,19 @@ def diff_snapshots(
         for mt in sorted(old_mt - new_mt):
             changes["removed_markets"].append((et, mt))
 
-        # Price changes on shared markets
+        # Price changes on shared markets (based on yes_ask — the current
+        # market price Kalshi displays, not the potentially stale last_price)
         for mt in sorted(old_mt & new_mt):
             om = old_markets[mt]
             nm = new_markets[mt]
-
-            old_price = om.get("last_price")
-            new_price = nm.get("last_price")
 
             # Detect settlement
             if om.get("status") != "settled" and nm.get("status") == "settled":
                 changes["settled_markets"].append((et, mt, nm.get("name", mt)))
                 continue
+
+            old_price = om.get("yes_ask")
+            new_price = nm.get("yes_ask")
 
             if old_price is not None and new_price is not None:
                 delta = new_price - old_price
@@ -619,46 +620,31 @@ COLOR_SUMMARY = 0x5865F2  # blurple
 COLOR_RULES_CHANGE = 0xFF9900  # orange
 
 
-def build_market_table(markets: dict, show_volume: bool = True) -> str:
+def build_market_table(markets: dict) -> str:
     """
-    Build a code-block table of ALL markets for an event, sorted by price desc.
+    Build a code-block table of ALL markets for an event, sorted by Yes price desc.
     """
     sorted_markets = sorted(
         markets.values(),
-        key=lambda m: m.get("last_price") or 0,
+        key=lambda m: m.get("yes_ask") or m.get("last_price") or 0,
         reverse=True,
     )
 
     lines: list[str] = []
-
-    # Header
-    if show_volume:
-        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6} {'24h Vol':>10}")
-        lines.append("-" * 52)
-    else:
-        lines.append(f"{'Model':<20} {'Last':>6} {'Bid':>6} {'Ask':>6}")
-        lines.append("-" * 42)
+    lines.append(f"{'Model':<20} {'Yes':>6} {'Bid':>6} {'Last':>6}")
+    lines.append("-" * 42)
 
     for m in sorted_markets:
         name = (m.get("name") or "Unknown")[:20]
-        last = m.get("last_price")
-        bid = m.get("yes_bid")
         ask = m.get("yes_ask")
+        bid = m.get("yes_bid")
+        last = m.get("last_price")
 
-        last_s = f"{last}¢" if last is not None else "—"
-        bid_s = f"{bid}¢" if bid is not None else "—"
         ask_s = f"{ask}¢" if ask is not None else "—"
+        bid_s = f"{bid}¢" if bid is not None else "—"
+        last_s = f"{last}¢" if last is not None else "—"
 
-        if show_volume:
-            vol = m.get("volume_24h")
-            vol_s = f"{vol:,}" if vol is not None else "—"
-            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6} {vol_s:>10}")
-        else:
-            lines.append(f"{name:<20} {last_s:>6} {bid_s:>6} {ask_s:>6}")
-
-    if show_volume:
-        lines.append("")
-        lines.append("24h Vol = contracts traded in last 24 hours")
+        lines.append(f"{name:<20} {ask_s:>6} {bid_s:>6} {last_s:>6}")
 
     return "\n".join(lines)
 
@@ -729,15 +715,14 @@ def build_embeds(
             ev = new_snapshot.get(et, {})
             m = ev.get("markets", {}).get(mt, {})
             name = m.get("name", mt)
-            last = cents_str(m.get("last_price"))
+            yes = cents_str(m.get("yes_ask"))
             bid = cents_str(m.get("yes_bid"))
-            ask = cents_str(m.get("yes_ask"))
             series = ev.get("series_ticker", "")
             friendly = format_event_label(et, ev)
             url = event_web_url(series, et)
             lines.append(
                 f"**{name}** added to [{friendly}]({url})\n"
-                f"Last: {last} | Bid: {bid} | Ask: {ask}"
+                f"Yes: {yes} | Bid: {bid}"
             )
         all_embeds.append(
             {
@@ -765,8 +750,8 @@ def build_embeds(
             series = ev.get("series_ticker", "")
             friendly = format_event_label(et, ev)
             url = event_web_url(series, et)
-            vol = pc.get("volume_24h")
-            vol_str = f" | 24h vol: {vol:,} contracts" if vol else ""
+            vol = pc.get("volume_24h") or 0
+            vol_str = f" | 24h vol: {vol:,}" if vol >= 1000 else ""
             lines.append(
                 f"**{name}** ({direction}{delta}¢): {old_p} → {new_p}{vol_str}\n"
                 f"[{friendly}]({url})"
