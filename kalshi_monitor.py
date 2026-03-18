@@ -291,6 +291,26 @@ def derive_market_name(market: dict) -> str:
     return market.get("title", ticker) or ticker
 
 
+def _dollars_to_cents(val: Any) -> int | None:
+    """Convert a dollar-string like '0.5600' to integer cents (56), or None."""
+    if val is None:
+        return None
+    try:
+        return round(float(val) * 100)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fp_to_int(val: Any) -> int | None:
+    """Convert a fixed-point string like '1234.00' to integer, or None."""
+    if val is None:
+        return None
+    try:
+        return round(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
 def build_snapshot(events: list[dict]) -> dict:
     """
     Build a normalized snapshot from raw Kalshi events.
@@ -298,6 +318,11 @@ def build_snapshot(events: list[dict]) -> dict:
     Returns a dict keyed by event_ticker, each containing:
       - event metadata (title, dates)
       - markets dict keyed by market ticker with prices / volume
+
+    Note: Kalshi migrated from integer-cent fields (yes_bid, yes_ask, etc.)
+    to dollar-string fields (yes_bid_dollars, yes_ask_dollars, etc.) as of
+    March 12, 2026. We read the new _dollars fields first, falling back to
+    the legacy integer fields for backward compatibility with cached state.
     """
     snapshot: dict[str, Any] = {}
     for event in events:
@@ -308,18 +333,27 @@ def build_snapshot(events: list[dict]) -> dict:
         for m in markets_raw:
             ticker = m.get("ticker", "")
             name = derive_market_name(m)
+
+            # Prefer new _dollars fields, fall back to legacy integer fields
+            yes_bid = _dollars_to_cents(m.get("yes_bid_dollars")) if m.get("yes_bid_dollars") is not None else m.get("yes_bid")
+            yes_ask = _dollars_to_cents(m.get("yes_ask_dollars")) if m.get("yes_ask_dollars") is not None else m.get("yes_ask")
+            last_price = _dollars_to_cents(m.get("last_price_dollars")) if m.get("last_price_dollars") is not None else m.get("last_price")
+            volume = _fp_to_int(m.get("volume_fp")) if m.get("volume_fp") is not None else m.get("volume")
+            volume_24h = _fp_to_int(m.get("volume_24h_fp")) if m.get("volume_24h_fp") is not None else m.get("volume_24h")
+            open_interest = _fp_to_int(m.get("open_interest_fp")) if m.get("open_interest_fp") is not None else m.get("open_interest")
+
             markets[ticker] = {
                 "name": name,
                 "title": m.get("title", ""),
                 "subtitle": m.get("subtitle", ""),
                 "yes_sub_title": m.get("yes_sub_title", ""),
                 "status": m.get("status", ""),
-                "yes_bid": m.get("yes_bid"),
-                "yes_ask": m.get("yes_ask"),
-                "last_price": m.get("last_price"),
-                "volume": m.get("volume"),
-                "volume_24h": m.get("volume_24h"),
-                "open_interest": m.get("open_interest"),
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "last_price": last_price,
+                "volume": volume,
+                "volume_24h": volume_24h,
+                "open_interest": open_interest,
                 "close_time": m.get("close_time", ""),
                 "result": m.get("result", ""),
             }
