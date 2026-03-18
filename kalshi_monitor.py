@@ -1099,6 +1099,7 @@ def run_single_check(args: argparse.Namespace) -> bool:
         logger.info("No significant changes detected")
 
     # Build and send embeds
+    send_failed = False
     should_send = changed or args.force_send
     if should_send:
         embed_messages = build_embeds(changes, new_snapshot, args.force_send)
@@ -1122,26 +1123,37 @@ def run_single_check(args: argparse.Namespace) -> bool:
                     logger.error(
                         "No webhook URL provided. Set DISCORD_WEBHOOK_URL or use --webhook-url"
                     )
+                    send_failed = True
                 else:
-                    send_discord_embeds(
+                    ok = send_discord_embeds(
                         args.webhook_url,
                         embed_messages,
                         retries=args.retries,
                         backoff=args.retry_backoff_seconds,
                     )
+                    if not ok:
+                        send_failed = True
+                        logger.error(
+                            "Discord send failed — skipping state save so changes "
+                            "will be retried on next run"
+                        )
 
-    # Persist new state
-    new_state = {
-        "snapshot": new_snapshot,
-        "pdf_hashes": new_pdf_hashes,
-        "last_check": datetime.now(timezone.utc).isoformat(),
-        "last_changed": (
-            datetime.now(timezone.utc).isoformat()
-            if changed
-            else old_state.get("last_changed", "")
-        ),
-    }
-    save_state(args.state_file, new_state)
+    # Only persist state if notifications were delivered (or there was nothing to send).
+    # If Discord send failed, keep old state so changes are retried next run.
+    if send_failed:
+        logger.warning("State NOT saved due to Discord send failure")
+    else:
+        new_state = {
+            "snapshot": new_snapshot,
+            "pdf_hashes": new_pdf_hashes,
+            "last_check": datetime.now(timezone.utc).isoformat(),
+            "last_changed": (
+                datetime.now(timezone.utc).isoformat()
+                if changed
+                else old_state.get("last_changed", "")
+            ),
+        }
+        save_state(args.state_file, new_state)
 
     return should_send
 
