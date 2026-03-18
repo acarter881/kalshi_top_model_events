@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,7 +38,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore state from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .github/state/
           key: kalshi-state-${{ github.ref_name }}-${{ github.run_id }}
@@ -63,7 +63,7 @@ jobs:
           python kalshi_monitor.py $ARGS
 
       - name: Save state to cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always()
         with:
           path: .github/state/
