@@ -2,8 +2,10 @@ name: Kalshi AI Model Monitor
 
 on:
   schedule:
-    # Run every 10 minutes
-    - cron: "*/10 * * * *"
+    # Run every 5 minutes (GitHub Actions cron minimum), with a staggered
+    # backup schedule offset by 2 minutes as a hedge against cron delays.
+    - cron: "*/5 * * * *"
+    - cron: "2-59/5 * * * *"
   workflow_dispatch:
     inputs:
       force_send:
@@ -19,6 +21,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: kalshi-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -50,7 +56,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          ARGS="--loop --max-checks 4 --min-interval-seconds 60 --max-interval-seconds 120"
+          ARGS="--loop --max-checks 10 --min-interval-seconds 30 --max-interval-seconds 45"
 
           if [ "${{ inputs.force_send }}" = "true" ]; then
             ARGS="$ARGS --force-send"
