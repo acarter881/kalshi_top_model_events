@@ -6,7 +6,7 @@ Monitors Kalshi prediction market events for AI model rankings (KXTOPMODEL, KXLL
 
 ## Architecture
 
-Single-file Python script (`kalshi_monitor.py`) with no framework. Runs as a GitHub Actions cron job every 10 minutes, performing 4 checks per run with randomized 60-120s intervals. State is persisted via GitHub Actions cache (not committed to the repo). The Kalshi API is public and requires no authentication.
+Single-file Python script (`kalshi_monitor.py`) with no framework. Runs as a GitHub Actions cron job every 5 minutes (with a second cron offset by 2 minutes as a hedge against GitHub Actions cron delays), performing 10 checks per run with randomized 30-45s intervals (~5-7 min of continuous polling per run). A `kalshi-monitor` concurrency group with `cancel-in-progress: false` prevents overlapping runs from racing on the Actions cache. State is persisted via GitHub Actions cache (not committed to the repo). The Kalshi API is public and requires no authentication.
 
 ### Key Data Flow
 
@@ -30,7 +30,7 @@ python kalshi_monitor.py --dry-run
 python kalshi_monitor.py --force-send --webhook-url "https://discord.com/api/webhooks/..."
 
 # Loop mode (mimics CI)
-python kalshi_monitor.py --loop --max-checks 4 --dry-run
+python kalshi_monitor.py --loop --max-checks 10 --min-interval-seconds 30 --max-interval-seconds 45 --dry-run
 ```
 
 State file defaults to `.github/state/kalshi_state.json` (gitignored). On first run with no state file, the script silently populates state without sending notifications (no old snapshot to diff against).
@@ -65,8 +65,9 @@ Add an entry to `SERIES_CONFIG` with the series ticker as key. Set `sort_order` 
 Change `DEFAULT_PRICE_THRESHOLD` or pass `--price-threshold N` (in cents). The workflow YAML hardcodes some args — check both places.
 
 ### Changing check frequency
-- Cron schedule: `.github/workflows/kalshi-monitor.yml` line 5
-- Checks per run / intervals: workflow YAML `ARGS` line and/or CLI defaults in `parse_args()`
+- Cron schedule: `.github/workflows/kalshi-monitor.yml` — there are two `cron:` entries (`*/5 * * * *` and a staggered `2-59/5 * * * *`); update both if you change cadence.
+- Checks per run / intervals: workflow YAML `ARGS` line and/or CLI defaults in `parse_args()`. Per-run loop coverage should roughly match the cron interval to avoid dead air between runs.
+- Concurrency: the `kalshi-monitor` concurrency group keeps overlapping runs serialized — required when increasing cadence so the Actions cache save/restore doesn't race.
 
 ## Key Functions
 

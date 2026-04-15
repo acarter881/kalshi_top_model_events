@@ -26,7 +26,7 @@ Discord messages are sent when:
 ## How It Works
 
 ```
-GitHub Actions (cron every 10 min)
+GitHub Actions (cron every 5 min, plus a 2-minute-staggered backup schedule)
   └─ kalshi_monitor.py
        ├─ Fetches open events from Kalshi public API (no auth needed)
        │    GET /trade-api/v2/events?series_ticker=...&status=open&with_nested_markets=true
@@ -39,7 +39,7 @@ GitHub Actions (cron every 10 min)
        └─ Saves updated state to Actions cache
 ```
 
-Each workflow run performs **4 checks** with randomized 60–120s intervals, giving roughly one check every ~1.5 minutes across each 10-minute window.
+Each workflow run performs **10 checks** with randomized 30–45s intervals (~5–7 min of continuous polling), and the cron fires every 5 minutes. Two staggered cron entries (`*/5` and `2-59/5`) hedge against GitHub Actions' best-effort cron delays, while a `kalshi-monitor` concurrency group prevents overlapping runs from racing on the Actions cache.
 
 ## Setup
 
@@ -82,7 +82,7 @@ python kalshi_monitor.py --dry-run
 python kalshi_monitor.py --force-send
 
 # Loop mode (what GitHub Actions uses)
-python kalshi_monitor.py --loop --max-checks 4 --min-interval-seconds 60 --max-interval-seconds 120
+python kalshi_monitor.py --loop --max-checks 10 --min-interval-seconds 30 --max-interval-seconds 45
 
 # Custom price threshold (notify on ≥3¢ moves)
 python kalshi_monitor.py --price-threshold 3
