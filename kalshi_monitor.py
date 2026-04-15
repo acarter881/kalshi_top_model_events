@@ -62,6 +62,21 @@ CST = timezone(timedelta(hours=-6))
 # Keywords in event titles that indicate a yearly event (case-insensitive)
 YEARLY_TITLE_KEYWORDS = ("year", "annual", "end of 202")
 
+# Change types that trigger Discord notifications. Change types NOT in this
+# set (new_events, removed_events, price_changes) are still detected and
+# logged, but are silenced — they are noise (scheduled events, price churn)
+# that the user doesn't want to be pinged about. Only series-level structural
+# changes (new model added, settlement rules changed, etc.) produce alerts.
+ALERT_CHANGE_TYPES = frozenset(
+    {
+        "new_markets",
+        "removed_markets",
+        "settled_markets",
+        "settlement_source_changes",
+        "pdf_changes",
+    }
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Monitor Kalshi AI model events")
@@ -602,7 +617,29 @@ def diff_pdf_hashes(
 
 
 def has_changes(changes: dict) -> bool:
+    """
+    Return True if any alert-worthy change type has items.
+
+    Only change types in ALERT_CHANGE_TYPES count — silenced types like
+    price_changes and new_events are detected by diff_snapshots() but do
+    not trigger notifications.
+    """
+    return any(bool(changes.get(k)) for k in ALERT_CHANGE_TYPES)
+
+
+def has_any_changes(changes: dict) -> bool:
+    """Return True if any change type (including silenced ones) has items."""
     return any(bool(v) for v in changes.values())
+
+
+def filter_alert_changes(changes: dict) -> dict:
+    """
+    Return a copy of `changes` with non-alert change types cleared.
+
+    Used to hide silenced types from build_embeds() so they never appear
+    in Discord messages, while preserving the full diff for logging.
+    """
+    return {k: (v if k in ALERT_CHANGE_TYPES else []) for k, v in changes.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1122,21 +1159,25 @@ def run_single_check(args: argparse.Namespace) -> bool:
     # Compute diff
     changes = diff_snapshots(old_snapshot, new_snapshot, args.price_threshold)
     changes["pdf_changes"] = pdf_changes
-    changed = has_changes(changes)
+    changed = has_changes(changes)  # alert-worthy changes only
 
-    if changed:
+    if has_any_changes(changes):
         logger.info("Changes detected:")
         for key, val in changes.items():
             if val:
-                logger.info("  %s: %d item(s)", key, len(val))
+                marker = "[alert]" if key in ALERT_CHANGE_TYPES else "[silenced]"
+                logger.info("  %s %s: %d item(s)", marker, key, len(val))
     else:
-        logger.info("No significant changes detected")
+        logger.info("No changes detected")
 
-    # Build and send embeds
+    # Build and send embeds — silenced change types (price_changes, new_events,
+    # removed_events) are filtered out so they never reach Discord, even if
+    # other alert-worthy changes are also firing in the same run.
     send_failed = False
     should_send = changed or args.force_send
     if should_send:
-        embed_messages = build_embeds(changes, new_snapshot, args.force_send)
+        alert_only_changes = filter_alert_changes(changes)
+        embed_messages = build_embeds(alert_only_changes, new_snapshot, args.force_send)
         if embed_messages:
             if args.dry_run:
                 logger.info(
